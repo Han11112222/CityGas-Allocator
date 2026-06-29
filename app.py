@@ -10,8 +10,8 @@ from typing import Optional
 # ──────────────────────────────────────────
 # 설정 (GitHub 연동)
 # ──────────────────────────────────────────
-GITHUB_USER = "Han11112222"         # 본인 깃허브 유저명
-GITHUB_REPO = "gas-settlement"       # 본인 레포명
+GITHUB_USER = "Han11112222"         # 👈 이 부분을 형님의 '실제 깃허브 아이디'로 변경!
+GITHUB_REPO = "gas-settlement"       
 GITHUB_BRANCH = "main"
 
 # 정산 테이블에 표시할 표준 용도 순서 및 소계 여부 정의
