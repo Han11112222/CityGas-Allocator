@@ -8,10 +8,10 @@ from io import BytesIO
 from typing import Optional
 
 # ──────────────────────────────────────────
-# 설정 (GitHub 연동)
+# 설정 (GitHub 연동) - 요청하신 정보로 세팅 완료!
 # ──────────────────────────────────────────
-GITHUB_USER = "Han11112222"         # 👈 이 부분을 형님의 '실제 깃허브 아이디'로 변경!
-GITHUB_REPO = "gas-settlement"       
+GITHUB_USER = "Han11112222"
+GITHUB_REPO = "CityGas-Allocator"
 GITHUB_BRANCH = "main"
 
 # 정산 테이블에 표시할 표준 용도 순서 및 소계 여부 정의
@@ -30,8 +30,8 @@ TARGET_LABELS = [
 ]
 
 # L열(판매량계) = 인덱스 11, M열(구성비) = 인덱스 12 (0-based)
-COL_SALES_TOTAL = 11   # L열
-COL_RATIO       = 12   # M열
+COL_SALES_TOTAL = 11
+COL_RATIO       = 12
 
 
 # ──────────────────────────────────────────
@@ -76,25 +76,21 @@ def parse_yearmonth(filename: str) -> Optional[tuple[int, int]]:
 
 
 # ──────────────────────────────────────────
-# 엑셀 동적 파싱 (하드코딩 행 번호 제거)
+# 엑셀 동적 파싱 
 # ──────────────────────────────────────────
 def read_gasco_sheet(xlsx_bytes: bytes) -> dict:
-    """
-    '가스공사용(MJ)' 시트에서 텍스트 매칭을 통해 용도별 판매량계(MJ)·구성비(%)를 동적 추출
-    """
     wb = openpyxl.load_workbook(BytesIO(xlsx_bytes), read_only=True, data_only=True)
     if "가스공사용(MJ)" not in wb.sheetnames:
         return {}
     ws = wb["가스공사용(MJ)"]
     
     result = {}
-    is_juteak_section = False  # 주택용 하부의 '소계'를 정확히 잡기 위한 플래그
+    is_juteak_section = False 
     
     for row in ws.iter_rows(values_only=True):
         if len(row) <= max(COL_SALES_TOTAL, COL_RATIO):
             continue
             
-        # B열(인덱스1)과 C열(인덱스2) 텍스트의 공백을 제거하여 비교 안정성 확보
         val_b = str(row[1]).replace(" ", "").strip() if row[1] is not None else ""
         val_c = str(row[2]).replace(" ", "").strip() if row[2] is not None else ""
         
@@ -104,11 +100,10 @@ def read_gasco_sheet(xlsx_bytes: bytes) -> dict:
         label = None
         is_subtotal = False
         
-        # 텍스트 매칭 조건 분기
         if is_juteak_section and val_c == "소계":
             label = "주택용(소계)"
             is_subtotal = True
-            is_juteak_section = False  # 주택용 구간 종료
+            is_juteak_section = False
         elif val_b == "일반용" and (val_c == "" or val_c == "소계"):
             label = "일반용"
             is_subtotal = True
@@ -153,7 +148,6 @@ def calc_settlement(
     curr_data: dict,
     method: str = "당월단독",
 ) -> pd.DataFrame:
-    """용도별 배분량(GJ) 계산"""
     rows = []
 
     total_prev = prev_data.get("합계", {}).get("sales_mj", None)
@@ -167,7 +161,6 @@ def calc_settlement(
         prev_mj = prev.get("sales_mj")
         curr_mj = curr.get("sales_mj")
 
-        # 구성비 계산 로직
         if method == "전월평균" and prev_mj and curr_mj and total_prev and total_curr:
             r_prev = prev_mj / total_prev * 100
             r_curr = curr_mj / total_curr * 100
@@ -223,7 +216,7 @@ def main():
         xlsx_files = get_github_file_list()
 
     if not xlsx_files:
-        st.warning("GitHub 레포에서 xlsx 파일을 찾지 못했습니다. GITHUB_USER / GITHUB_REPO 설정을 확인하거나 파일 확장자가 .xlsx인지 확인하세요.")
+        st.warning("GitHub 레포에서 xlsx 파일을 찾지 못했습니다. 파일 확장자가 .xlsx인지 확인하세요.")
         return
 
     file_map: dict[tuple[int, int], str] = {}
@@ -323,7 +316,6 @@ def main():
             file_name=f"도매정산결과_{selected_label.replace(' ', '')}.csv",
             mime="text/csv",
         )
-
 
 if __name__ == "__main__":
     main()
