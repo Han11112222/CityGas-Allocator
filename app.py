@@ -8,13 +8,12 @@ from io import BytesIO
 from typing import Optional
 
 # ──────────────────────────────────────────
-# 설정 (GitHub 연동) - 요청하신 정보로 세팅 완료!
+# 설정 (GitHub 연동)
 # ──────────────────────────────────────────
 GITHUB_USER = "Han11112222"
 GITHUB_REPO = "CityGas-Allocator"
 GITHUB_BRANCH = "main"
 
-# 정산 테이블에 표시할 표준 용도 순서 및 소계 여부 정의
 TARGET_LABELS = [
     {"label": "주택용(소계)",   "is_subtotal": True},
     {"label": "일반용",         "is_subtotal": True},
@@ -29,33 +28,36 @@ TARGET_LABELS = [
     {"label": "합계",           "is_subtotal": True},
 ]
 
-# L열(판매량계) = 인덱스 11, M열(구성비) = 인덱스 12 (0-based)
 COL_SALES_TOTAL = 11
 COL_RATIO       = 12
 
 
 # ──────────────────────────────────────────
-# GitHub 파일 목록 & 다운로드
+# GitHub 파일 목록 & 다운로드 (캐시 제거 - 실시간 갱신)
 # ──────────────────────────────────────────
-@st.cache_data(ttl=300)
 def get_github_file_list() -> list[str]:
-    """레포 루트의 파일 목록을 가져옴"""
+    """레포 루트의 파일 목록을 캐시 없이 실시간으로 가져옴"""
     url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/git/trees/{GITHUB_BRANCH}?recursive=1"
     headers = {}
     token = os.environ.get("GITHUB_TOKEN", "")
     if token:
         headers["Authorization"] = f"token {token}"
     r = requests.get(url, headers=headers, timeout=10)
+    
+    # 디버깅을 위해 API 응답 상태코드를 Session State에 저장
+    st.session_state['api_status'] = r.status_code
+    
     if r.status_code != 200:
-        st.error(f"GitHub API 오류: {r.status_code} – {r.text[:200]}")
+        st.session_state['api_error_msg'] = r.text[:200]
         return []
+        
     tree = r.json().get("tree", [])
+    st.session_state['all_files'] = [item["path"] for item in tree] # 모든 파일 목록 저장
     return [item["path"] for item in tree if item["path"].endswith(".xlsx")]
 
 
 @st.cache_data(ttl=300)
 def download_xlsx(filename: str) -> Optional[bytes]:
-    """raw 파일 다운로드"""
     url = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{requests.utils.quote(filename)}"
     headers = {}
     token = os.environ.get("GITHUB_TOKEN", "")
@@ -68,7 +70,6 @@ def download_xlsx(filename: str) -> Optional[bytes]:
 
 
 def parse_yearmonth(filename: str) -> Optional[tuple[int, int]]:
-    """파일명에서 (연도, 월) 추출"""
     m = re.search(r"(\d{4})년(\d{1,2})월", filename)
     if m:
         return int(m.group(1)), int(m.group(2))
@@ -139,9 +140,6 @@ def read_gasco_sheet(xlsx_bytes: bytes) -> dict:
     return result
 
 
-# ──────────────────────────────────────────
-# 정산 계산
-# ──────────────────────────────────────────
 def calc_settlement(
     supply_gj: float,
     prev_data: dict,
@@ -149,7 +147,6 @@ def calc_settlement(
     method: str = "당월단독",
 ) -> pd.DataFrame:
     rows = []
-
     total_prev = prev_data.get("합계", {}).get("sales_mj", None)
     total_curr = curr_data.get("합계", {}).get("sales_mj", None)
 
@@ -180,43 +177,38 @@ def calc_settlement(
             "배분공급량(GJ)": round(alloc_gj, 3) if alloc_gj else None,
             "비고":           "소계" if target["is_subtotal"] else "",
         })
-
     return pd.DataFrame(rows)
 
 
-# ──────────────────────────────────────────
-# Streamlit UI
-# ──────────────────────────────────────────
 def main():
-    st.set_page_config(
-        page_title="도시가스 도매요금 정산 계산기",
-        page_icon="🔥",
-        layout="wide",
-    )
+    st.set_page_config(page_title="도시가스 도매요금 정산", page_icon="🔥", layout="wide")
 
     st.markdown(
         """
         <style>
-        .main-title {
-            font-size: 1.6rem; font-weight: 700;
-            color: #1a3a5c; border-bottom: 2px solid #e65c00;
-            padding-bottom: 0.3rem; margin-bottom: 0.2rem;
-        }
+        .main-title { font-size: 1.6rem; font-weight: 700; color: #1a3a5c; border-bottom: 2px solid #e65c00; padding-bottom: 0.3rem; margin-bottom: 0.2rem; }
         .sub-title { font-size: 0.9rem; color: #666; margin-bottom: 1.2rem; }
-        .highlight { background: #f0f4fa; border-left: 3px solid #1a3a5c;
-                     padding: 0.5rem 0.8rem; border-radius: 4px; font-size: 0.85rem; }
+        .highlight { background: #f0f4fa; border-left: 3px solid #1a3a5c; padding: 0.5rem 0.8rem; border-radius: 4px; font-size: 0.85rem; }
         </style>
         <div class="main-title">🔥 도시가스 도매요금 정산 계산기</div>
-        <div class="sub-title">판매량정산서 기반 용도별 구성비 & 공급량 자동 산출</div>
-        """,
-        unsafe_allow_html=True,
+        <div class="sub-title">판매량정산서 기반 용도별 구성비 & 공급량 자동 산출 (실시간 연동 버전)</div>
+        """, unsafe_allow_html=True
     )
 
-    with st.spinner("GitHub에서 판매량정산서 목록 로딩 중…"):
+    with st.spinner("GitHub에서 판매량정산서 목록 실시간 로딩 중…"):
         xlsx_files = get_github_file_list()
 
+    # --- 디버깅 창 (문제가 뭔지 화면에 띄워줍니다) ---
+    with st.expander("🛠️ 시스템 엑스레이 (디버깅) - 여기를 눌러보세요!", expanded=not bool(xlsx_files)):
+        st.write(f"GitHub 접속 상태 코드: `{st.session_state.get('api_status', 'N/A')}` (200이면 정상)")
+        if st.session_state.get('api_status') != 200:
+            st.error(f"오류 메시지: {st.session_state.get('api_error_msg')}")
+        st.write("GitHub에서 발견한 전체 파일 목록:")
+        st.write(st.session_state.get('all_files', []))
+    # ---------------------------------------------------
+
     if not xlsx_files:
-        st.warning("GitHub 레포에서 xlsx 파일을 찾지 못했습니다. 파일 확장자가 .xlsx인지 확인하세요.")
+        st.warning("여전히 xlsx 파일을 찾지 못했습니다. 바로 위 '시스템 엑스레이' 창을 열어 에러 원인을 확인해 주세요.")
         return
 
     file_map: dict[tuple[int, int], str] = {}
@@ -243,21 +235,12 @@ def main():
     with col2:
         st.markdown("**② 수급량 입력 (GJ)**")
         supply_gj = st.number_input(
-            "월 수급량 (GJ)",
-            min_value=0.0,
-            value=1774554.307,
-            step=1000.0,
-            format="%.3f",
-            help="가스공사정산서 또는 공급량 보고서의 총 수급량(GJ)을 입력하세요.",
+            "월 수급량 (GJ)", min_value=0.0, value=1774554.307, step=1000.0, format="%.3f"
         )
 
     with col3:
         st.markdown("**③ 구성비 산출 방식**")
-        method = st.radio(
-            "방식",
-            ["당월단독", "전월평균"],
-            help="당월단독: 해당 월 판매량만 사용\n전월평균: (m-1)월 + m월 구성비 평균값 사용",
-        )
+        method = st.radio("방식", ["당월단독", "전월평균"])
 
     curr_idx = sorted_keys.index(selected_ym)
     prev_ym = sorted_keys[curr_idx - 1] if curr_idx > 0 else None
@@ -265,8 +248,7 @@ def main():
     st.markdown(
         f'<div class="highlight">📁 당월 파일: <b>{file_map[selected_ym]}</b>'
         + (f' &nbsp;|&nbsp; 전월 파일: <b>{file_map[prev_ym]}</b>' if prev_ym else "")
-        + "</div>",
-        unsafe_allow_html=True,
+        + "</div>", unsafe_allow_html=True
     )
     st.markdown("")
 
