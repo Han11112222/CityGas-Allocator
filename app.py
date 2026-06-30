@@ -116,8 +116,9 @@ def parse_target_month_from_filename(filename: str) -> Optional[tuple]:
 # ──────────────────────────────────────────
 def read_verification_sheet(xlsx_bytes: bytes, sheet_name: str = "3월검증") -> Optional[pd.DataFrame]:
     """
-    원본 raw data 시트를 읽어 (상품, 서비스, 2월보정, 3월보정, 4월보정) DataFrame 반환
-    헤더 행(9행)을 자동 탐지하여 '상품'/'서비스' 컬럼을 찾는다.
+    원본 raw data 시트를 읽어 (상품, 서비스, 2월보정, 3월보정, 4월보정) DataFrame 반환.
+    헤더 행을 자동 탐지하여 '상품'/'서비스' 컬럼을 찾는다.
+    일부 파일은 '상품/용도/서비스' 3컬럼 구조(부분 서브셋)이므로 이 경우도 흡수한다.
     """
     try:
         xl = pd.ExcelFile(BytesIO(xlsx_bytes))
@@ -126,7 +127,6 @@ def read_verification_sheet(xlsx_bytes: bytes, sheet_name: str = "3월검증") -
         return None
 
     if sheet_name not in xl.sheet_names:
-        # 시트명이 다를 수 있으므로 '검증'이 포함된 시트를 탐색
         candidates = [s for s in xl.sheet_names if "검증" in s]
         if not candidates:
             return None
@@ -134,7 +134,6 @@ def read_verification_sheet(xlsx_bytes: bytes, sheet_name: str = "3월검증") -
 
     raw = xl.parse(sheet_name, header=None)
 
-    # '상품' 헤더가 있는 행 탐색
     header_row_idx = None
     for i in range(min(20, len(raw))):
         row_vals = [str(v).strip() for v in raw.iloc[i].tolist()]
@@ -148,7 +147,6 @@ def read_verification_sheet(xlsx_bytes: bytes, sheet_name: str = "3월검증") -
     data_rows = raw.iloc[header_row_idx + 1:].reset_index(drop=True)
     data_rows.columns = header
 
-    # 보정공급량 컬럼 자동 탐지 (예: '합계 : 2월보정공급량')
     month_cols = {}
     for col in data_rows.columns:
         col_str = str(col)
@@ -156,15 +154,18 @@ def read_verification_sheet(xlsx_bytes: bytes, sheet_name: str = "3월검증") -
         if m and "합계" in col_str:
             month_cols[int(m.group(1))] = col
 
-    # 상품/서비스 forward-fill (병합 셀 대응)
-    data_rows["상품"] = data_rows["상품"].ffill()
+    has_yongdo = "용도" in data_rows.columns
 
-    result_cols = ["상품", "서비스"] + list(month_cols.values())
+    data_rows["상품"] = data_rows["상품"].ffill()
+    if has_yongdo:
+        data_rows["용도"] = data_rows["용도"].ffill()
+
+    base_cols = ["상품", "서비스"] + (["용도"] if has_yongdo else [])
+    result_cols = base_cols + list(month_cols.values())
     df = data_rows[result_cols].copy()
     df = df.dropna(subset=["서비스"])
     df = df[df["상품"] != "총합계"]
 
-    # 컬럼명을 월 숫자로 정규화
     rename_map = {v: f"M{k}" for k, v in month_cols.items()}
     df = df.rename(columns=rename_map)
 
@@ -173,6 +174,14 @@ def read_verification_sheet(xlsx_bytes: bytes, sheet_name: str = "3월검증") -
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
     return df
+
+
+def is_full_dataset(df: pd.DataFrame) -> bool:
+    """파싱된 raw data가 전체 상품 종류를 충분히 포함하는지 확인.
+       서브셋 파일(일반용만, 취사용만 등)을 거르기 위한 안전장치."""
+    if df is None or "상품" not in df.columns:
+        return False
+    return df["상품"].nunique() >= 10
 
 
 def allocate_by_usage(df: pd.DataFrame, month_col: str) -> dict:
@@ -258,10 +267,16 @@ def main():
     st.markdown("---")
     col1, col2 = st.columns([3, 2])
 
+    # '전체'가 파일명에 포함된 파일을 메인 후보로 우선 정렬
+    sorted_files = sorted(xlsx_files, key=lambda f: ("전체" not in f, f))
+
     with col1:
         st.markdown("**① Raw Data 파일 선택**")
-        st.caption("'전체' 또는 메인 데이터가 포함된 파일을 선택하세요 (일반용/취사용 등 부분 파일은 제외)")
-        selected_file = st.selectbox("파일", xlsx_files)
+        st.caption("⚠️ 파일명에 '전체'가 포함된 메인 파일을 선택하세요. "
+                    "'일반용', '취사용' 등 특정 용도만 담긴 부분 파일은 검증/보정용이므로 제외하세요.")
+        selected_file = st.selectbox("파일", sorted_files)
+        if "전체" not in selected_file:
+            st.warning("⚠️ 선택한 파일명에 '전체'가 없습니다. 부분(서브셋) 데이터일 수 있습니다.")
 
     with col2:
         st.markdown("**② 기준 월 선택**")
@@ -287,6 +302,16 @@ def main():
             df_raw = read_verification_sheet(xlsx_bytes)
             if df_raw is None:
                 st.error("'검증' 시트를 찾거나 파싱할 수 없습니다. 파일 구조를 확인해 주세요.")
+                return
+
+            if not is_full_dataset(df_raw):
+                st.error(
+                    f"⚠️ 이 파일은 전체 데이터가 아닌 것으로 보입니다 "
+                    f"(상품 종류 {df_raw['상품'].nunique()}개만 발견됨, 전체는 보통 15개 이상). "
+                    f"'전체'가 포함된 메인 파일을 다시 선택해 주세요."
+                )
+                with st.expander("발견된 상품 목록 보기"):
+                    st.write(sorted(df_raw["상품"].dropna().unique().tolist()))
                 return
 
             month_col = f"M{target_month}"
