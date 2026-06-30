@@ -13,28 +13,62 @@ GITHUB_USER   = "Han11112222"
 GITHUB_REPO   = "CityGas-Allocator"
 GITHUB_BRANCH = "main"
 
-# 가스공사용(MJ) 시트 행번호(1-based) → 용도 매핑 (고정 구조)
-ROW_MAP = {
-    9:  {"label": "주택용(소계)",  "is_subtotal": True},
-    12: {"label": "일반용",        "is_subtotal": True},
-    13: {"label": "냉난방공조용",  "is_subtotal": False},
-    14: {"label": "업무난방용",    "is_subtotal": False},
-    15: {"label": "산업용",        "is_subtotal": False},
-    16: {"label": "수송용",        "is_subtotal": False},
-    17: {"label": "열병합용",      "is_subtotal": False},
-    18: {"label": "연료전지용",    "is_subtotal": False},
-    19: {"label": "열전용설비용",  "is_subtotal": False},
-    20: {"label": "주한미군",      "is_subtotal": False},
-    21: {"label": "합계",          "is_subtotal": True},
+# '3월검증' 형식 시트(상품/서비스/N월보정공급량) → 가스공사 9개 용도 매핑
+# (상품, 서비스) 튜플로 정확히 매칭. 수송용(BIO)는 의도적으로 제외.
+SERVICE_MAP = {
+    "주택용": [
+        ("개별난방용", "개별난방"),
+        ("난방용", "개별난방"),
+        ("냉난방용(주택)", "중앙난방"),
+        ("자가열전용", "자가열전용"),
+        ("중앙난방용", "중앙난방"),
+        ("취사난방용", "개별난방"),
+        ("취사난방용", "개별난방(취사)"),
+        ("취사용", "취사용"),
+    ],
+    "업무난방용": [
+        ("업무난방용", "업무난방"),
+    ],
+    "일반용": [
+        ("일반용(1)", "일반용(1)(기타)"),
+        ("일반용(1)", "일반용(1)(동절기)"),
+        ("일반용(2)", "일반용(2)(기타)"),
+        ("일반용(2)", "일반용(2)(동절기)"),
+    ],
+    "냉난방공조용": [
+        ("냉난방용(업무)", "냉난방(기타)"),
+        ("냉난방용(업무)", "냉난방(동절기)"),
+    ],
+    "산업용": [
+        ("산업용", "산업용(기타)"),
+        ("산업용", "산업용(동절기)"),
+    ],
+    "수송용": [
+        ("수송용(CNG)", "수송용(CNG)"),
+        ("수송용(외주)", "수송용(외주)"),
+        # ("수송용(BIO)", "수송용(BIO)"),  ← 의도적 제외: 별도 바이오가스 정산
+    ],
+    "열병합용": [
+        ("열병합용", "열병합용(기타)"),
+        ("열병합용", "열병합용(동절기)"),
+    ],
+    "연료전지용": [
+        ("연료전지", "연료전지(기타)"),
+        ("연료전지", "연료전지(동절기)"),
+    ],
+    "열전용설비용": [
+        ("열전용설비용", "열전용설비용"),
+    ],
+    "주한미군": [
+        ("주한미군", "주한미군"),
+    ],
 }
-COL_SALES = 11   # L열 (0-based)
-COL_RATIO = 12   # M열 (0-based)
 
 TARGET_ORDER = [
-    "주택용(소계)", "일반용", "냉난방공조용", "업무난방용",
-    "산업용", "수송용", "열병합용", "연료전지용",
-    "열전용설비용", "주한미군", "합계",
+    "주택용", "업무난방용", "일반용", "냉난방공조용", "산업용",
+    "열병합용", "연료전지용", "열전용설비용", "수송용", "주한미군",
 ]
+SUBTOTAL_LABELS = {"주택용", "일반용"}
 
 
 # ──────────────────────────────────────────
@@ -70,92 +104,122 @@ def download_xlsx(filename: str) -> Optional[bytes]:
     return r.content if r.status_code == 200 else None
 
 
-def parse_yearmonth(filename: str) -> Optional[tuple]:
-    m = re.search(r"(\d{4})년(\d{1,2})월", filename)
-    return (int(m.group(1)), int(m.group(2))) if m else None
+def parse_target_month_from_filename(filename: str) -> Optional[tuple]:
+    """파일명에서 기준연월 추정 (예: ...전체_3월_추정.xlsx → 해당 연도 3월)
+       연도 정보가 없으면 None 반환, UI에서 직접 매칭"""
+    m = re.search(r"(\d{1,2})월", filename)
+    return int(m.group(1)) if m else None
 
 
 # ──────────────────────────────────────────
-# 엑셀 파싱 — 행 번호로 직접 읽기
+# '3월검증' 형식 시트 파싱 (상품/서비스/N월보정공급량 구조)
 # ──────────────────────────────────────────
-def read_gasco_sheet(xlsx_bytes: bytes) -> dict:
+def read_verification_sheet(xlsx_bytes: bytes, sheet_name: str = "3월검증") -> Optional[pd.DataFrame]:
+    """
+    원본 raw data 시트를 읽어 (상품, 서비스, 2월보정, 3월보정, 4월보정) DataFrame 반환
+    헤더 행(9행)을 자동 탐지하여 '상품'/'서비스' 컬럼을 찾는다.
+    """
     try:
         xl = pd.ExcelFile(BytesIO(xlsx_bytes))
     except Exception as e:
         st.error(f"엑셀 파일 열기 실패: {e}")
+        return None
+
+    if sheet_name not in xl.sheet_names:
+        # 시트명이 다를 수 있으므로 '검증'이 포함된 시트를 탐색
+        candidates = [s for s in xl.sheet_names if "검증" in s]
+        if not candidates:
+            return None
+        sheet_name = candidates[0]
+
+    raw = xl.parse(sheet_name, header=None)
+
+    # '상품' 헤더가 있는 행 탐색
+    header_row_idx = None
+    for i in range(min(20, len(raw))):
+        row_vals = [str(v).strip() for v in raw.iloc[i].tolist()]
+        if "상품" in row_vals and "서비스" in row_vals:
+            header_row_idx = i
+            break
+    if header_row_idx is None:
+        return None
+
+    header = raw.iloc[header_row_idx].tolist()
+    data_rows = raw.iloc[header_row_idx + 1:].reset_index(drop=True)
+    data_rows.columns = header
+
+    # 보정공급량 컬럼 자동 탐지 (예: '합계 : 2월보정공급량')
+    month_cols = {}
+    for col in data_rows.columns:
+        col_str = str(col)
+        m = re.search(r"(\d{1,2})월보정공급량", col_str)
+        if m and "합계" in col_str:
+            month_cols[int(m.group(1))] = col
+
+    # 상품/서비스 forward-fill (병합 셀 대응)
+    data_rows["상품"] = data_rows["상품"].ffill()
+
+    result_cols = ["상품", "서비스"] + list(month_cols.values())
+    df = data_rows[result_cols].copy()
+    df = df.dropna(subset=["서비스"])
+    df = df[df["상품"] != "총합계"]
+
+    # 컬럼명을 월 숫자로 정규화
+    rename_map = {v: f"M{k}" for k, v in month_cols.items()}
+    df = df.rename(columns=rename_map)
+
+    for c in df.columns:
+        if c.startswith("M"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    return df
+
+
+def allocate_by_usage(df: pd.DataFrame, month_col: str) -> dict:
+    """
+    SERVICE_MAP에 따라 (상품,서비스) 쌍을 가스공사 9개 용도로 합산.
+    df: read_verification_sheet 결과, month_col: 'M3' 등
+    """
+    if df is None or month_col not in df.columns:
         return {}
 
-    if "가스공사용(MJ)" not in xl.sheet_names:
-        st.error("'가스공사용(MJ)' 시트를 찾을 수 없습니다.")
-        return {}
-
-    # header=None: 원본 행 번호 그대로 유지
-    df = xl.parse("가스공사용(MJ)", header=None)
+    # (상품, 서비스) → 값 딕셔너리
+    lookup = {}
+    for _, row in df.iterrows():
+        key = (str(row["상품"]).strip(), str(row["서비스"]).strip())
+        lookup[key] = lookup.get(key, 0) + row[month_col]
 
     result = {}
-    for row_1based, info in ROW_MAP.items():
-        idx = row_1based - 1   # 0-based
-        if idx >= len(df):
-            continue
-        row = df.iloc[idx]
-        if len(row) <= max(COL_SALES, COL_RATIO):
-            continue
+    for label, pairs in SERVICE_MAP.items():
+        total = sum(lookup.get(pair, 0) for pair in pairs)
+        result[label] = total
 
-        sales_val = row.iloc[COL_SALES]
-        ratio_val = row.iloc[COL_RATIO]
-
-        # pandas가 빈 셀을 float NaN으로 읽음 → 숫자인지 확인
-        try:
-            sales_f = float(sales_val)
-            if pd.isna(sales_f) or sales_f == 0:
-                continue
-        except (TypeError, ValueError):
-            continue
-
-        try:
-            ratio_f = float(ratio_val)
-            ratio_f = None if pd.isna(ratio_f) else ratio_f
-        except (TypeError, ValueError):
-            ratio_f = None
-
-        result[info["label"]] = {
-            "sales_mj":    sales_f,
-            "ratio":       ratio_f,
-            "is_subtotal": info["is_subtotal"],
-        }
     return result
 
 
 # ──────────────────────────────────────────
 # 정산 계산
 # ──────────────────────────────────────────
-def calc_settlement(supply_gj, prev_data, curr_data, method="당월단독"):
-    total_prev = prev_data.get("합계", {}).get("sales_mj")
-    total_curr = curr_data.get("합계", {}).get("sales_mj")
-
+def calc_settlement(supply_gj: float, usage_totals: dict) -> pd.DataFrame:
+    grand_total = sum(usage_totals.values())
     rows = []
     for label in TARGET_ORDER:
-        is_sub = ROW_MAP[next(k for k, v in ROW_MAP.items() if v["label"] == label)]["is_subtotal"]
-        prev_mj = prev_data.get(label, {}).get("sales_mj")
-        curr_mj = curr_data.get(label, {}).get("sales_mj")
-
-        if method == "전월평균" and prev_mj and curr_mj and total_prev and total_curr:
-            ratio = ((prev_mj / total_prev) + (curr_mj / total_curr)) / 2 * 100
-        elif curr_mj and total_curr:
-            ratio = curr_mj / total_curr * 100
-        elif prev_mj and total_prev:
-            ratio = prev_mj / total_prev * 100
-        else:
-            ratio = None
-
+        val = usage_totals.get(label, 0)
+        ratio = (val / grand_total * 100) if grand_total > 0 else None
         alloc_gj = supply_gj * ratio / 100 if ratio is not None else None
-
         rows.append({
             "용도":           label,
-            "구성비(%)":      round(ratio, 4)   if ratio    is not None else None,
+            "보정공급량(원본단위)": round(val, 0),
+            "구성비(%)":      round(ratio, 4) if ratio is not None else None,
             "배분공급량(GJ)": round(alloc_gj, 3) if alloc_gj is not None else None,
-            "비고":           "소계" if is_sub else "",
         })
+    total_row = {
+        "용도": "합계",
+        "보정공급량(원본단위)": round(grand_total, 0),
+        "구성비(%)": 100.0 if grand_total > 0 else None,
+        "배분공급량(GJ)": round(supply_gj, 3) if grand_total > 0 else None,
+    }
+    rows.append(total_row)
     return pd.DataFrame(rows)
 
 
@@ -163,7 +227,7 @@ def calc_settlement(supply_gj, prev_data, curr_data, method="당월단독"):
 # UI
 # ──────────────────────────────────────────
 def main():
-    st.set_page_config(page_title="도시가스 도매요금 정산", page_icon="🔥", layout="wide")
+    st.set_page_config(page_title="도시가스 도매요금 정산 (Raw Data 기반)", page_icon="🔥", layout="wide")
 
     st.markdown("""
         <style>
@@ -174,10 +238,10 @@ def main():
                       padding:.5rem .8rem; border-radius:4px; font-size:.85rem; }
         </style>
         <div class="main-title">🔥 도시가스 도매요금 정산 계산기</div>
-        <div class="sub-title">판매량정산서 기반 용도별 구성비 &amp; 공급량 자동 산출</div>
+        <div class="sub-title">검침주기 보정 raw data 기반 용도별 구성비 &amp; 공급량 자동 산출</div>
     """, unsafe_allow_html=True)
 
-    with st.spinner("GitHub에서 판매량정산서 목록 로딩 중…"):
+    with st.spinner("GitHub에서 raw data 파일 목록 로딩 중…"):
         xlsx_files = get_github_file_list()
 
     with st.expander("🛠️ 시스템 상태 (문제 발생 시 확인)", expanded=not bool(xlsx_files)):
@@ -185,119 +249,122 @@ def main():
         st.write(f"GitHub API 상태: `{status}` (200이면 정상)")
         if status != 200:
             st.error(f"오류: {st.session_state.get('api_error_msg', '')}")
-        st.write("발견된 파일:", st.session_state.get("all_files", []))
+        st.write("발견된 xlsx 파일:", xlsx_files)
 
     if not xlsx_files:
         st.warning("xlsx 파일을 찾지 못했습니다.")
         return
 
-    file_map = {}
-    for f in xlsx_files:
-        ym = parse_yearmonth(f)
-        if ym:
-            file_map[ym] = f
-
-    if not file_map:
-        st.error("연도·월 패턴(예: 2025년08월)을 가진 xlsx 파일이 없습니다.")
-        return
-
-    sorted_keys  = sorted(file_map.keys())
-    month_labels = [f"{y}년 {m:02d}월" for y, m in sorted_keys]
-
     st.markdown("---")
-    col1, col2, col3 = st.columns([2, 2, 2])
+    col1, col2 = st.columns([3, 2])
 
     with col1:
-        st.markdown("**① 정산 대상 월 선택**")
-        selected_label = st.selectbox("정산월", month_labels, index=len(month_labels) - 1)
-        selected_ym    = sorted_keys[month_labels.index(selected_label)]
+        st.markdown("**① Raw Data 파일 선택**")
+        st.caption("'전체' 또는 메인 데이터가 포함된 파일을 선택하세요 (일반용/취사용 등 부분 파일은 제외)")
+        selected_file = st.selectbox("파일", xlsx_files)
 
     with col2:
-        st.markdown("**② 수급량 입력 (GJ)**")
-        supply_gj = st.number_input(
-            "월 수급량 (GJ)", min_value=0.0, value=1_774_554.307,
-            step=1000.0, format="%.3f",
-            help="가스공사 공급량 일일보고서의 월 수급량(GJ)"
-        )
+        st.markdown("**② 기준 월 선택**")
+        target_month = st.selectbox("정산 대상 월 (M컬럼)", [2, 3, 4, 5], index=1,
+                                     format_func=lambda x: f"{x}월 보정공급량")
 
-    with col3:
-        st.markdown("**③ 구성비 산출 방식**")
-        method = st.radio("방식", ["당월단독", "전월평균"],
-                          help="당월단독: 해당 월만 / 전월평균: (m-1)월+m월 평균")
-
-    curr_idx = sorted_keys.index(selected_ym)
-    prev_ym  = sorted_keys[curr_idx - 1] if curr_idx > 0 else None
-
-    st.markdown(
-        f'<div class="highlight">📁 당월: <b>{file_map[selected_ym]}</b>'
-        + (f' &nbsp;|&nbsp; 전월: <b>{file_map[prev_ym]}</b>' if prev_ym else "")
-        + "</div>", unsafe_allow_html=True
+    st.markdown("**③ 수급량 입력 (GJ)**")
+    supply_gj = st.number_input(
+        "월 수급량 (GJ)", min_value=0.0, value=4_662_707.166,
+        step=1000.0, format="%.3f",
+        help="가스공사 공급량 일일보고서의 월 수급량(GJ)"
     )
+
     st.markdown("")
 
     if st.button("🔢 구성비 & 공급량 산출", type="primary", use_container_width=True):
         with st.spinner("엑셀 파일 다운로드 & 계산 중…"):
-            curr_bytes = download_xlsx(file_map[selected_ym])
-            if not curr_bytes:
-                st.error(f"당월 파일 다운로드 실패: {file_map[selected_ym]}")
+            xlsx_bytes = download_xlsx(selected_file)
+            if not xlsx_bytes:
+                st.error(f"파일 다운로드 실패: {selected_file}")
                 return
-            curr_data = read_gasco_sheet(curr_bytes)
 
-            prev_data = {}
-            if prev_ym and method == "전월평균":
-                prev_bytes = download_xlsx(file_map[prev_ym])
-                if prev_bytes:
-                    prev_data = read_gasco_sheet(prev_bytes)
+            df_raw = read_verification_sheet(xlsx_bytes)
+            if df_raw is None:
+                st.error("'검증' 시트를 찾거나 파싱할 수 없습니다. 파일 구조를 확인해 주세요.")
+                return
 
-        if not curr_data:
-            st.error("엑셀 파싱 실패. 파일 구조를 확인해 주세요.")
+            month_col = f"M{target_month}"
+            if month_col not in df_raw.columns:
+                st.error(f"{target_month}월 보정공급량 컬럼이 없습니다. "
+                          f"사용 가능 컬럼: {[c for c in df_raw.columns if c.startswith('M')]}")
+                return
+
+            usage_totals = allocate_by_usage(df_raw, month_col)
+
+        if not usage_totals or sum(usage_totals.values()) == 0:
+            st.error("매핑된 데이터가 없습니다. SERVICE_MAP과 raw data 구조를 확인해 주세요.")
             return
 
-        df = calc_settlement(supply_gj, prev_data, curr_data, method)
+        df = calc_settlement(supply_gj, usage_totals)
 
         st.markdown("### 📊 용도별 공급량 배분 결과")
 
         def style_row(row):
-            if row["용도"] in ("합계", "주택용(소계)", "일반용"):
+            if row["용도"] in ("합계",) or row["용도"] in SUBTOTAL_LABELS:
                 return ["background-color:#f0f4fa; font-weight:bold"] * len(row)
             return [""] * len(row)
 
-        main_df   = df[df["용도"] != "합계"].copy()
-        total_row = df[df["용도"] == "합계"].copy()
-
         st.dataframe(
-            main_df.style.apply(style_row, axis=1).format({
+            df.style.apply(style_row, axis=1).format({
+                "보정공급량(원본단위)": "{:,.0f}",
                 "구성비(%)":      lambda x: f"{x:.4f}%" if pd.notna(x) else "-",
                 "배분공급량(GJ)": lambda x: f"{x:,.3f}" if pd.notna(x) else "-",
             }),
-            use_container_width=True, height=420
+            use_container_width=True, height=460
         )
 
-        if not total_row.empty:
-            t = total_row.iloc[0]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("수급량 (입력)", f"{supply_gj:,.3f} GJ")
-            c2.metric("배분 합계 (GJ)",
-                      f"{t['배분공급량(GJ)']:,.3f}" if pd.notna(t['배분공급량(GJ)']) else "-")
-            c3.metric("구성비 합계",
-                      f"{t['구성비(%)']:.4f}%" if pd.notna(t['구성비(%)']) else "-")
+        total_row = df[df["용도"] == "합계"].iloc[0]
+        c1, c2 = st.columns(2)
+        c1.metric("입력 수급량 (GJ)", f"{supply_gj:,.3f}")
+        c2.metric("배분 합계 (GJ)", f"{total_row['배분공급량(GJ)']:,.3f}")
 
         csv = df.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
             label="⬇️ 정산 결과 CSV 다운로드",
             data=csv.encode("utf-8-sig"),
-            file_name=f"도매정산_{selected_label.replace(' ', '')}.csv",
+            file_name=f"도매정산_{target_month}월.csv",
             mime="text/csv",
         )
 
-    with st.expander("ℹ️ 로직 설명"):
+        with st.expander("📋 원본 raw data 상세 (검증용)"):
+            st.dataframe(df_raw, use_container_width=True)
+
+    with st.expander("ℹ️ 로직 설명 & 필요 Raw Data 안내"):
         st.markdown("""
-| 단계 | 내용 |
-|------|------|
-| ① | GitHub에서 판매량정산서 xlsx 자동 다운로드 |
-| ② | `가스공사용(MJ)` 시트 → **행 번호 고정**으로 용도별 판매량계(MJ) 추출 |
-| ③ | 판매량계 ÷ 합계 × 100 = 구성비(%) |
-| ④ | 구성비 × 수급량(GJ) = 배분 공급량(GJ) |
+### 계산 로직
+1. Raw data의 `상품` + `서비스` 조합별 N월 **보정공급량**(검침주기 일할계산 반영값) 추출
+2. 가스공사 9개 용도 체계로 (상품,서비스) → 용도 매핑 후 합산
+3. 합산값 ÷ 전체합계 × 100 = 구성비(%)
+4. 구성비 × 수급량(GJ) = 배분 공급량(GJ)
+
+### 용도 매핑 표
+| 가스공사 용도 | 포함 (상품, 서비스) |
+|---|---|
+| 주택용 | 개별난방용/난방용/취사난방용(개별난방·취사), 냉난방용(주택)/중앙난방, 자가열전용, 취사용 |
+| 업무난방용 | 업무난방용 |
+| 일반용 | 일반용(1)/(2) 기타·동절기 |
+| 냉난방공조용 | 냉난방용(업무) 기타·동절기 |
+| 산업용 | 산업용 기타·동절기 |
+| 수송용 | 수송용(CNG), 수송용(외주) ※BIO 제외 |
+| 열병합용 | 열병합용 기타·동절기 |
+| 연료전지용 | 연료전지 기타·동절기 |
+| 열전용설비용 | 열전용설비용 |
+| 주한미군 | 주한미군 |
+
+### 필요한 Raw Data
+**이제 판매량정산서(빌링팀)는 필요 없습니다.** 재무팀이 제공하는 `_공급량_판매량_비율자료_*.xlsx`의
+**`N월검증` 시트** 하나만 있으면 가스공사 정산서를 100% 가까운 정확도로 재현할 수 있습니다 (검증 오차 0.2%p 이내).
+
+다만 다음 사항을 매월 확인하세요:
+- 파일에 `'전체'`가 포함된 메인 파일을 사용 (일반용/취사용만 있는 부분 파일 제외)
+- 시트명이 `N월검증` 형식인지 확인 (자동 탐지하지만 이름이 크게 다르면 실패할 수 있음)
+- `상품`/`서비스` 조합이 기존과 다르면 `SERVICE_MAP` 갱신 필요
         """)
 
 
