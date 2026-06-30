@@ -20,6 +20,7 @@ SERVICE_MAP = {
         ("개별난방용", "개별난방"),
         ("난방용", "개별난방"),
         ("냉난방용(주택)", "중앙난방"),
+        ("냉난방용(주택)", "냉난방(하절기)"),
         ("자가열전용", "자가열전용"),
         ("중앙난방용", "중앙난방"),
         ("취사난방용", "개별난방"),
@@ -38,6 +39,7 @@ SERVICE_MAP = {
     "냉난방공조용": [
         ("냉난방용(업무)", "냉난방(기타)"),
         ("냉난방용(업무)", "냉난방(동절기)"),
+        ("냉난방용(업무)", "냉난방(하절기)"),
     ],
     "산업용": [
         ("산업용", "산업용(기타)"),
@@ -114,9 +116,10 @@ def parse_target_month_from_filename(filename: str) -> Optional[tuple]:
 # ──────────────────────────────────────────
 # '3월검증' 형식 시트 파싱 (상품/서비스/N월보정공급량 구조)
 # ──────────────────────────────────────────
-def read_verification_sheet(xlsx_bytes: bytes, sheet_name: str = "3월검증") -> Optional[pd.DataFrame]:
+def read_verification_sheet(xlsx_bytes: bytes, sheet_name: Optional[str] = None) -> Optional[pd.DataFrame]:
     """
-    원본 raw data 시트를 읽어 (상품, 서비스, 2월보정, 3월보정, 4월보정) DataFrame 반환.
+    원본 raw data 시트를 읽어 (상품, 서비스, N월보정공급량...) DataFrame 반환.
+    시트명이 'N월검증' 형식으로 매월 바뀌므로 '검증'이 포함된 시트를 자동 탐색한다.
     헤더 행을 자동 탐지하여 '상품'/'서비스' 컬럼을 찾는다.
     일부 파일은 '상품/용도/서비스' 3컬럼 구조(부분 서브셋)이므로 이 경우도 흡수한다.
     """
@@ -126,7 +129,7 @@ def read_verification_sheet(xlsx_bytes: bytes, sheet_name: str = "3월검증") -
         st.error(f"엑셀 파일 열기 실패: {e}")
         return None
 
-    if sheet_name not in xl.sheet_names:
+    if sheet_name is None or sheet_name not in xl.sheet_names:
         candidates = [s for s in xl.sheet_names if "검증" in s]
         if not candidates:
             return None
