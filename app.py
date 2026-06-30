@@ -254,9 +254,10 @@ def main():
 
     st.markdown("""
         <style>
-        .main-title { font-size:1.6rem; font-weight:700; color:#1a3a5c;
-                      border-bottom:2px solid #e65c00; padding-bottom:.3rem; margin-bottom:.2rem; }
-        .sub-title  { font-size:.9rem; color:#666; margin-bottom:1.2rem; }
+        .main-title { font-size:2.4rem; font-weight:800; color:#1a3a5c;
+                      border-bottom:3px solid #e65c00; padding-bottom:.4rem; margin-bottom:.3rem; }
+        .sub-title  { font-size:1rem; color:#666; margin-bottom:1.4rem; }
+        .step-title { font-size:1.25rem; font-weight:700; color:#1a3a5c; margin-bottom:.4rem; }
         .highlight  { background:#f0f4fa; border-left:3px solid #1a3a5c;
                       padding:.5rem .8rem; border-radius:4px; font-size:.85rem; }
         </style>
@@ -279,28 +280,48 @@ def main():
         return
 
     st.markdown("---")
-    col1, col2 = st.columns([3, 2])
 
-    # '전체'가 파일명에 포함된 파일을 메인 후보로 우선 정렬
-    sorted_files = sorted(xlsx_files, key=lambda f: ("전체" not in f, f))
+    # 메인(전체) 파일만 후보로 사용 — 서브셋(일반용/취사용 등) 파일은 자동 제외
+    SUBSET_MARKERS = ["일반용", "취사용", "취사추정"]
+    main_candidates = [
+        f for f in xlsx_files
+        if "전체" in f and not any(marker in f for marker in SUBSET_MARKERS)
+    ]
+    if not main_candidates:
+        main_candidates = [f for f in xlsx_files if "전체" in f] or xlsx_files
 
-    with col1:
-        st.markdown("**① Raw Data 파일 선택**")
-        st.caption("⚠️ 파일명에 '전체'가 포함된 메인 파일을 선택하세요. "
-                    "'일반용', '취사용' 등 특정 용도만 담긴 부분 파일은 검증/보정용이므로 제외하세요.")
-        selected_file = st.selectbox("파일", sorted_files)
-        if "전체" not in selected_file:
-            st.warning("⚠️ 선택한 파일명에 '전체'가 없습니다. 부분(서브셋) 데이터일 수 있습니다.")
+    # 파일명에서 "N월" 추출 → {월: 파일경로} 매핑 (동일 월에 여러 파일이 있으면 가장 마지막 파일 우선)
+    month_to_file: dict[int, str] = {}
+    for f in sorted(main_candidates):
+        m = re.search(r"(\d{1,2})월", f)
+        if m:
+            month_to_file[int(m.group(1))] = f
 
-    with col2:
-        st.markdown("**② 기준 월 선택**")
-        target_month = st.selectbox("정산 대상 월 (M컬럼)", [2, 3, 4, 5], index=1,
-                                     format_func=lambda x: f"{x}월 보정공급량")
+    st.markdown('<div class="step-title">① 기준 월 선택</div>', unsafe_allow_html=True)
+    available_months = sorted(month_to_file.keys()) if month_to_file else [2, 3, 4, 5]
+    default_idx = len(available_months) - 1 if available_months else 0
+    target_month = st.selectbox(
+        "정산 대상 월", available_months, index=default_idx,
+        format_func=lambda x: f"{x}월 보정공급량", label_visibility="collapsed",
+    )
 
-    st.markdown("**③ 수급량 입력 (GJ)**")
+    # 기준 월에 맞는 raw data 파일 자동 선택
+    selected_file = month_to_file.get(target_month)
+    if selected_file:
+        st.markdown(
+            f'<div class="highlight">📁 자동 선택된 Raw Data 파일: <b>{selected_file}</b></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.warning(f"{target_month}월에 해당하는 '전체' raw data 파일을 자동으로 찾지 못했습니다. "
+                    "직접 선택해 주세요.")
+        selected_file = st.selectbox("파일 직접 선택", sorted(xlsx_files))
+
+    st.markdown("")
+    st.markdown('<div class="step-title">② 수급량 입력 (GJ)</div>', unsafe_allow_html=True)
     supply_gj = st.number_input(
         "월 수급량 (GJ)", min_value=0.0, value=4_662_707.166,
-        step=1000.0, format="%.3f",
+        step=1000.0, format="%.3f", label_visibility="collapsed",
         help="가스공사 공급량 일일보고서의 월 수급량(GJ)"
     )
 
@@ -356,7 +377,7 @@ def main():
                 "배분공급량(GJ)": lambda x: f"{x:,.3f}" if pd.notna(x) else "-",
                 "환산배율(참고)": lambda x: f"{x:.3f}" if pd.notna(x) else "-",
             }),
-            use_container_width=True, height=460
+            use_container_width=True, height=460, hide_index=True
         )
         st.caption(
             "💡 **환산배율(참고)**: 원본판매량(MJ)÷1000을 배분공급량(GJ)으로 나눈 값입니다. "
@@ -379,7 +400,7 @@ def main():
         )
 
         with st.expander("📋 원본 raw data 상세 (검증용)"):
-            st.dataframe(df_raw, use_container_width=True)
+            st.dataframe(df_raw, use_container_width=True, hide_index=True)
 
     with st.expander("ℹ️ 로직 설명 & 증량(增量) 처리 방식"):
         st.markdown("""
